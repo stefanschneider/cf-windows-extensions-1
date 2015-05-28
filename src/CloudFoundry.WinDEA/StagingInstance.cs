@@ -11,6 +11,7 @@ using System.Text;
 using System.Threading;
 using CloudFoundry.WinDEA.Messages;
 using CloudFoundry.Utilities;
+using System.IO.Compression;
 
 namespace CloudFoundry.WinDEA
 {
@@ -242,10 +243,11 @@ namespace CloudFoundry.WinDEA
             }
         }
 
-        public void GetBuildpack(StagingStartMessageRequest message, string gitPath, string buildpacksDir)
+        public void GetBuildpack(StagingStartMessageRequest message, string gitPath, string buildpacksDir, string adminBuildpackDir)
         {
+            string buildpackUrl = message.Properties.Buildpack ?? message.Properties.BuildpackGitUrl;
 
-            if (message.Properties.Buildpack != null)
+            if (buildpackUrl != null)
             {
                 Logger.Info("Staging task {0}: Downloading buildpack from {1}", this.Properties.TaskId, message.Properties.Buildpack);
                 Directory.CreateDirectory(Path.Combine(this.Workspace.TempDir, "buildpacks"));
@@ -265,24 +267,109 @@ namespace CloudFoundry.WinDEA
                     throw new Exception("Buildpack does not support this application.");
                 }
             }
+            else if (message.Properties.BuildpackKey != null)
+            {
+                Logger.Info("Staging task {0}: Using admin buildpack {1}", this.Properties.TaskId, message.Properties.BuildpackKey);
+
+                TryCleanupUnrackedAdminBuildpacks(message.AdminBuildpacks, adminBuildpackDir);
+                var ab = message.AdminBuildpacks.First(i => i.Key == message.Properties.BuildpackKey);
+
+                var buildpackMutex = new Mutex(false, "admin-buildpack-" + ab.Key);
+                try
+                {
+                    buildpackMutex.WaitOne();
+
+                    DownloadAdminBuildpack(ab, adminBuildpackDir);
+
+                    var buildpackDir = Path.Combine(adminBuildpackDir, ab.Key);
+
+                    DEAUtilities.DirectoryCopy(buildpackDir, Path.Combine(this.Workspace.TempDir, "buildpack"), true);
+                }
+                finally
+                {
+                    buildpackMutex.ReleaseMutex();
+                    buildpackMutex.Dispose();
+                }
+
+                this.Buildpack = new Buildpack(Path.Combine(this.Workspace.TempDir, "buildpack"), Path.Combine(this.Workspace.StagedDir, "app"), this.Workspace.Cache, this.Workspace.StagingLogPath);
+
+                bool detected = this.Buildpack.Detect(this.Container);
+                if (!detected)
+                {
+                    throw new Exception("Buildpack does not support this application.");
+                }
+            }
             else
             {
                 Logger.Info("Staging task {0}: Detecting buildpack", this.Properties.TaskId);
-                foreach (string dir in Directory.EnumerateDirectories(buildpacksDir))
+
+                List<string> systemBuildpacks = Directory.EnumerateDirectories(buildpacksDir).ToList();
+
+                if (message.AdminBuildpacks != null)
                 {
-                    DEAUtilities.DirectoryCopy(dir, Path.Combine(this.Workspace.TempDir, "buildpack"), true);
-                    Buildpack bp = new Buildpack(Path.Combine(this.Workspace.TempDir, "buildpack"), Path.Combine(this.Workspace.StagedDir, "app"), this.Workspace.Cache, this.Workspace.StagingLogPath);
-                    bool success = bp.Detect(this.Container);
-                    if (success)
+                    TryCleanupUnrackedAdminBuildpacks(message.AdminBuildpacks, adminBuildpackDir);
+
+                    foreach (var ab in message.AdminBuildpacks)
                     {
-                        this.Buildpack = bp;
-                        break;
-                    }
-                    else
-                    {
-                        Directory.Delete(Path.Combine(this.Workspace.TempDir, "buildpack"), true);
+                        var dir = Path.Combine(adminBuildpackDir, ab.Key);
+
+                        var buildpackMutex = new Mutex(false, "admin-buildpack-" + ab.Key);
+                        try
+                        {
+                            buildpackMutex.WaitOne();
+
+                            DownloadAdminBuildpack(ab, adminBuildpackDir);
+
+                            var winBuildpack = IsWindowsCompatibleBuildpack(dir);
+                            if (!winBuildpack)
+                            {
+                                Logger.Info("Staging task {0}. Unable to detect compatible windows executables in buildpack bin. Ignoring buildpack {1}", this.Properties.TaskId, dir);
+                                continue;
+                            }
+
+                            DEAUtilities.DirectoryCopy(dir, Path.Combine(this.Workspace.TempDir, "buildpack"), true);
+                        }
+
+                        finally
+                        {
+                            buildpackMutex.ReleaseMutex();
+                            buildpackMutex.Dispose();
+                        }
+
+                        Buildpack bp = new Buildpack(Path.Combine(this.Workspace.TempDir, "buildpack"), Path.Combine(this.Workspace.StagedDir, "app"), this.Workspace.Cache, this.Workspace.StagingLogPath);
+                        bool success = bp.Detect(this.Container);
+                        if (success)
+                        {
+                            this.Buildpack = bp;
+                            break;
+                        }
+                        else
+                        {
+                            Directory.Delete(Path.Combine(this.Workspace.TempDir, "buildpack"), true);
+
+                        }
                     }
                 }
+
+                if (this.Buildpack == null)
+                {
+                    foreach (string dir in systemBuildpacks)
+                    {
+                        DEAUtilities.DirectoryCopy(dir, Path.Combine(this.Workspace.TempDir, "buildpack"), true);
+                        Buildpack bp = new Buildpack(Path.Combine(this.Workspace.TempDir, "buildpack"), Path.Combine(this.Workspace.StagedDir, "app"), this.Workspace.Cache, this.Workspace.StagingLogPath);
+                        bool success = bp.Detect(this.Container);
+                        if (success)
+                        {
+                            this.Buildpack = bp;
+                            break;
+                        }
+                        else
+                        {
+                            Directory.Delete(Path.Combine(this.Workspace.TempDir, "buildpack"), true);
+                        }
+                    }
+                }
+
 
                 if (this.Buildpack == null)
                 {
@@ -290,7 +377,114 @@ namespace CloudFoundry.WinDEA
                 }
                 Logger.Info("Staging task {0}: Detected buildpack {1}", this.Properties.TaskId, this.Buildpack.Name);
             }
+
             this.Properties.DetectedBuildpack = this.Buildpack.Name;
+        }
+
+        public static bool IsWindowsCompatibleBuildpack(string buildpackDir)
+        {
+            var bins = new string[] { "detect", "compile", "release" };
+            string[] pathExt = Environment.GetEnvironmentVariable("PATHEXT").Split(';');
+
+            foreach (var app in bins)
+            {
+                bool found = false;
+                foreach (string ext in pathExt)
+                {
+                    if (File.Exists(Path.Combine(buildpackDir, "bin", app + ext)))
+                    {
+                        found = true;
+                    }
+                }
+                if (!found)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        public void DownloadAdminBuildpack(StagingStartRequestAdminBuildpack adminBuildpack, string adminBuildpackDir)
+        {
+            string archiveFile = Path.Combine(adminBuildpackDir, adminBuildpack.Key + ".zip");
+            string destDir = Path.Combine(adminBuildpackDir, adminBuildpack.Key);
+
+            if (Directory.Exists(destDir))
+            {
+                Logger.Info("Skipping download for admin buildpack {0} because it was previously downloaded in {1} ", adminBuildpack.Key, destDir);
+                return;
+            }
+
+            Directory.CreateDirectory(destDir);
+
+            WebClient client = new WebClient();
+
+            Logger.Info("Downloading admin buildpack {0} in {1} from {2}", adminBuildpack.Key, destDir, adminBuildpack.Url);
+            try
+            {
+                var downloadUri = new Uri(adminBuildpack.Url);
+                client.Headers[HttpRequestHeader.Authorization] = "Basic " + System.Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(downloadUri.UserInfo));
+                client.DownloadFile(downloadUri, archiveFile);
+
+                ZipFile.ExtractToDirectory(archiveFile, destDir);
+            }
+            catch
+            {
+                Directory.Delete(destDir, true);
+                File.Delete(archiveFile);
+
+                throw;
+            }
+            finally
+            {
+                client.Dispose();
+            }
+
+            File.Delete(archiveFile);
+
+        }
+
+        public void TryCleanupUnrackedAdminBuildpacks(StagingStartRequestAdminBuildpack[] adminBuildpacks, string adminBuildpackDir)
+        {
+            var cachedAdminBuilpacks = new DirectoryInfo(adminBuildpackDir).EnumerateDirectories().ToDictionary(di => di.Name, di => di.FullName);
+
+            var adminBuildpacksLookup = adminBuildpacks.ToLookup(ab => ab.Key);
+
+            foreach (var cachedBuildpack in cachedAdminBuilpacks)
+            {
+                if (adminBuildpacksLookup.Contains(cachedBuildpack.Key))
+                {
+                    continue;
+                }
+
+                bool signaled = false;
+                var buildpackMutex = new Mutex(false, "admin-buildpack-" + cachedBuildpack.Key);
+
+                try
+                {
+
+                    signaled = buildpackMutex.WaitOne(0);
+
+                    if (signaled)
+                    {
+                        Logger.Info("Deleting old admin buildpack {0} from {1}", cachedBuildpack.Key, cachedBuildpack.Value);
+
+                        Directory.Delete(cachedBuildpack.Value, true);
+                    }
+                }
+                finally
+                {
+                    if (signaled)
+                    {
+                        buildpackMutex.ReleaseMutex();
+                    }
+
+                    buildpackMutex.Dispose();
+                }
+
+
+            }
+
         }
 
         public string GetStartCommand()
