@@ -17,6 +17,7 @@
     using SharpCompress.Reader.Tar;
     using SharpCompress.Common;
     using SharpCompress.Writer;
+    using System.IO.Compression;
 
     /// <summary>
     /// A class containing a set of file- and process-related methods. 
@@ -47,6 +48,8 @@
         /// <param name="outputPath">Destination directory for the extracted files</param>
         static public void ExtractArchive(string archiveFile, string outputPath)
         {
+            bool extractZip = false;
+
             using (var fileStream = File.OpenRead(archiveFile))
             {
                 using (var inputReader = ReaderFactory.Open(fileStream))
@@ -71,9 +74,13 @@
                         }
 
                     }
-                    else if (inputReader.ArchiveType == ArchiveType.Zip || inputReader.ArchiveType == ArchiveType.Tar)
+                    else if (inputReader.ArchiveType == ArchiveType.Tar)
                     {
                         inputReader.WriteAllToDirectory(outputPath, ExtractOptions.ExtractFullPath | ExtractOptions.Overwrite);
+                    }
+                    else if (inputReader.ArchiveType == ArchiveType.Zip)
+                    {
+                        extractZip = true;
                     }
                     else
                     {
@@ -81,6 +88,11 @@
                     }
                 }
 
+            }
+
+            if (extractZip)
+            {
+                ZipFile.ExtractToDirectory(archiveFile, outputPath);
             }
         }
 
@@ -92,30 +104,27 @@
         /// <param name="useZip">true for zip format; false for tar.gz format</param>
         static public void CreateArchive(string folderPath, string outputFile, bool useZip)
         {
-            using (var outputStream = File.OpenWrite(outputFile))
+            if (useZip)
             {
-
-                ArchiveType atype;
-                var cinfo = new CompressionInfo();
-
-                if (useZip)
+                ZipFile.CreateFromDirectory(folderPath, outputFile, CompressionLevel.Fastest, false);
+            }
+            else
+            {
+                using (var outputStream = File.OpenWrite(outputFile))
                 {
-                    atype = ArchiveType.Zip;
-                    cinfo.Type = CompressionType.Deflate;
-                    cinfo.DeflateCompressionLevel = SharpCompress.Compressor.Deflate.CompressionLevel.Default;
-                }
-                else
-                {
+
+                    ArchiveType atype;
+                    var cinfo = new CompressionInfo();
+
                     atype = ArchiveType.Tar;
                     cinfo.Type = CompressionType.GZip;
                     cinfo.DeflateCompressionLevel = SharpCompress.Compressor.Deflate.CompressionLevel.Default;
-                }
 
-                using (var awriter = WriterFactory.Open(outputStream, atype, cinfo))
-                {
-                    awriter.WriteAll(folderPath, "*", SearchOption.AllDirectories);
+                    using (var awriter = WriterFactory.Open(outputStream, atype, cinfo))
+                    {
+                        awriter.WriteAll(folderPath, "*", SearchOption.AllDirectories);
+                    }
                 }
-
 
             }
         }

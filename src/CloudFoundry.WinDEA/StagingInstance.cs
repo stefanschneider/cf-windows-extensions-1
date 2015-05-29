@@ -446,6 +446,11 @@ namespace CloudFoundry.WinDEA
 
         public void TryCleanupUnrackedAdminBuildpacks(StagingStartRequestAdminBuildpack[] adminBuildpacks, string adminBuildpackDir)
         {
+            if (!Directory.Exists(adminBuildpackDir))
+            {
+                return;
+            }
+
             var cachedAdminBuilpacks = new DirectoryInfo(adminBuildpackDir).EnumerateDirectories().ToDictionary(di => di.Name, di => di.FullName);
 
             var adminBuildpacksLookup = adminBuildpacks.ToLookup(ab => ab.Key);
