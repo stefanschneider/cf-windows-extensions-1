@@ -654,7 +654,7 @@
 
                 foreach (string key in whitelist)
                 {
-                    if (service[key] != null)
+                    if (service.ContainsKey(key))
                     {
                         svc_hash[key] = service[key];
                     }
